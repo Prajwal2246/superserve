@@ -318,6 +318,8 @@ export class Sandbox {
         url: `${config.baseUrl}/sandboxes/${sandboxId}`,
         headers: { "X-API-Key": config.apiKey },
         signal: options.signal,
+        // Don't drop a mid-transition sandbox on bulk delete (see retryConflict).
+        retryConflict: true,
       })
     } catch (err) {
       if (!(err instanceof NotFoundError)) throw err
@@ -547,14 +549,18 @@ export class Sandbox {
   /**
    * Delete this sandbox and all its resources.
    *
-   * Idempotent: if the sandbox is already deleted, this is a no-op.
+   * Idempotent: if the sandbox is already deleted, this is a no-op. The
+   * signal cancels the request and any retries.
    */
-  async kill(): Promise<void> {
+  async kill(options: { signal?: AbortSignal } = {}): Promise<void> {
     try {
       await requestVoid({
         method: "DELETE",
         url: `${this._config.baseUrl}/sandboxes/${this.id}`,
         headers: { "X-API-Key": this._config.apiKey },
+        signal: options.signal,
+        // Don't drop a mid-transition sandbox on bulk delete (see retryConflict).
+        retryConflict: true,
       })
     } catch (err) {
       if (!(err instanceof NotFoundError)) throw err

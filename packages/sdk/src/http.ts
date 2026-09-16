@@ -29,6 +29,14 @@ const USER_AGENT = `@superserve/sdk/${SDK_VERSION} (node/${
 
 // Retry tuning
 const DEFAULT_MAX_ATTEMPTS = 3
+// The conflict budget (see retryConflict) must outlast a transition. Typical
+// transitions settle in single-digit seconds, but a pause writes the sandbox's
+// memory snapshot and can legitimately take 30-60s on large sandboxes (see
+// tests/sdk-e2e-ts/README.md). Eleven attempts guarantee a request after the
+// 60s mark: even at minimum jitter (0.8x) the sleeps before the final attempt
+// sum past ~70s. Callers who can't wait pass an AbortSignal, which cancels
+// mid-backoff.
+const CONFLICT_MAX_ATTEMPTS = 11
 const BASE_BACKOFF_MS = 100
 const MAX_BACKOFF_MS = 30_000
 const RETRYABLE_STATUSES = new Set([429, 502, 503, 504])
@@ -51,6 +59,15 @@ interface RequestOptions {
    * control-plane responses (the default — unchanged `res.text()` behavior).
    */
   maxBytes?: number
+  /**
+   * Retry a 409 response on this (idempotent) request. Set it only where a 409
+   * is transient and self-clearing: a sandbox delete returns 409 while the
+   * sandbox is mid-transition (resuming/pausing/starting) and clears once the
+   * transition completes. Leave it unset where 409 is a terminal precondition
+   * (e.g. deleting a template that still has active sandboxes), so the call
+   * fails fast instead of retrying in vain. Only honored on GET/DELETE.
+   */
+  retryConflict?: boolean
 }
 
 /**
@@ -92,16 +109,20 @@ export function composeSignals(
   return { signal: controller.signal, release }
 }
 
-/** Sleep that ends early, rejecting with an AbortError, if signal aborts. */
+// Sleep that ends early, rejecting with the abort reason, if signal aborts:
+// without this, cancelling mid-backoff would silently wait out the full delay
+// before the abort is noticed on the next attempt.
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
+    const abortErr = () =>
+      signal?.reason ?? new DOMException("aborted", "AbortError")
     if (signal?.aborted) {
-      reject(new DOMException("aborted", "AbortError"))
+      reject(abortErr())
       return
     }
     const onAbort = () => {
       clearTimeout(timer)
-      reject(new DOMException("aborted", "AbortError"))
+      reject(abortErr())
     }
     const timer = setTimeout(() => {
       signal?.removeEventListener("abort", onAbort)
@@ -166,7 +187,8 @@ function isNetworkError(err: unknown): boolean {
  * and optional retry on transient conditions (429, 5xx, network errors).
  *
  * Only retries when `opts.retryable` is true. Callers must ensure the
- * operation is idempotent before enabling retries.
+ * operation is idempotent before enabling retries. `opts.retryConflict` also
+ * retries a self-clearing 409 (see RequestOptions.retryConflict).
  */
 async function retryableFetch(
   input: RequestInfo | URL,
@@ -175,12 +197,15 @@ async function retryableFetch(
     timeoutMs: number
     maxAttempts?: number
     retryable: boolean
+    retryConflict?: boolean
     userSignal?: AbortSignal
     /** Keep the attempt timer running until the caller releases the response. */
     timeoutCoversBody?: boolean
   },
 ): Promise<{ res: Response; release: () => void }> {
-  const maxAttempts = opts.retryable
+  // Extends to the conflict budget only after an actual 409 (below), so
+  // transient 5xx/429/network keep their default bound.
+  let maxAttempts = opts.retryable
     ? (opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS)
     : 1
 
@@ -209,8 +234,17 @@ async function retryableFetch(
     try {
       const res = await fetch(input, { ...init, signal })
 
-      // Retry on specific 5xx / 429
-      if (opts.retryable && RETRYABLE_STATUSES.has(res.status)) {
+      // Transient 5xx / 429, plus a caller-marked self-clearing 409 (see
+      // RequestOptions.retryConflict).
+      const retryableStatus =
+        RETRYABLE_STATUSES.has(res.status) ||
+        (res.status === 409 && opts.retryConflict === true)
+      if (opts.retryable && retryableStatus) {
+        // A self-clearing 409 (implies retryConflict) extends the budget; a
+        // caller-set maxAttempts is respected as-is.
+        if (res.status === 409 && opts.maxAttempts === undefined) {
+          maxAttempts = CONFLICT_MAX_ATTEMPTS
+        }
         if (attempt >= maxAttempts) {
           handedOff = true
           return { res, release: done }
@@ -285,8 +319,9 @@ async function readErrorBody(
  *
  * Throws typed SandboxError subclasses on non-2xx responses.
  *
- * Retries GET/DELETE on transient failures (429, 502/503/504, network errors).
- * POST/PATCH are never retried (not idempotent).
+ * Retries GET/DELETE on transient failures (429, 502/503/504, network errors),
+ * and — when `retryConflict` is set — a self-clearing 409. POST/PATCH are never
+ * retried (not idempotent).
  */
 export async function request<T>(opts: RequestOptions): Promise<T> {
   const {
@@ -297,6 +332,7 @@ export async function request<T>(opts: RequestOptions): Promise<T> {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     signal: userSignal,
     maxBytes,
+    retryConflict,
   } = opts
 
   const retryable = method === "GET" || method === "DELETE"
@@ -314,7 +350,13 @@ export async function request<T>(opts: RequestOptions): Promise<T> {
         headers: mergedHeaders,
         body: body !== undefined ? JSON.stringify(body) : undefined,
       },
-      { timeoutMs, retryable, userSignal, timeoutCoversBody: true },
+      {
+        timeoutMs,
+        retryable,
+        retryConflict,
+        userSignal,
+        timeoutCoversBody: true,
+      },
     )
     try {
       if (!res.ok) {

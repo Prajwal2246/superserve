@@ -58,6 +58,7 @@ USER_AGENT = (
 
 # Retry tuning
 _MAX_ATTEMPTS = 3
+_CONFLICT_MAX_ATTEMPTS = 11
 _BASE_BACKOFF = 0.1
 _MAX_BACKOFF = 30.0
 _RETRY_STATUS_CODES = {429, 502, 503, 504}
@@ -303,6 +304,7 @@ def _do_request_with_retry(
     timeout: float = DEFAULT_TIMEOUT,
     budget: float | None = None,
     client: httpx.Client | None = None,
+    retry_conflict: bool = False,
 ) -> httpx.Response:
     """Perform an HTTP request with retry for idempotent methods.
 
@@ -323,7 +325,8 @@ def _do_request_with_retry(
     last_exc: BaseException | None = None
 
     try:
-        for attempt in range(_MAX_ATTEMPTS):
+        max_attempts = _MAX_ATTEMPTS
+        for attempt in range(_CONFLICT_MAX_ATTEMPTS):
             attempt_timeout = _attempt_timeout(timeout, deadline)
             try:
                 response = _read_within(
@@ -344,7 +347,7 @@ def _do_request_with_retry(
                 last_exc = exc
                 if (
                     method_upper not in _IDEMPOTENT_METHODS
-                    or attempt == _MAX_ATTEMPTS - 1
+                    or attempt >= max_attempts - 1
                 ):
                     raise SandboxError(f"Network error: {exc}") from exc
                 time.sleep(_retry_delay(_compute_backoff(attempt), deadline))
@@ -352,10 +355,22 @@ def _do_request_with_retry(
             except httpx.HTTPError as exc:
                 raise SandboxError(f"Network error: {exc}") from exc
 
-            if (
+            # A self-clearing 409 is retried only on an idempotent method, like
+            # every other retry here; the flag never overrides that.
+            retry_this_conflict = (
+                retry_conflict
+                and response.status_code == 409
+                and method_upper in _IDEMPOTENT_METHODS
+            )
+            if retry_this_conflict:
+                max_attempts = _CONFLICT_MAX_ATTEMPTS
+
+            is_retryable = (
                 _should_retry_status(method_upper, response.status_code)
-                and attempt < _MAX_ATTEMPTS - 1
-            ):
+                or retry_this_conflict
+            )
+
+            if is_retryable and attempt < max_attempts - 1:
                 delay: float
                 if response.status_code == 429:
                     retry_after = _parse_retry_after(
@@ -395,6 +410,7 @@ def api_request(
     timeout: float = DEFAULT_TIMEOUT,
     budget: float | None = None,
     client: httpx.Client | None = None,
+    retry_conflict: bool = False,
 ) -> Any:
     """Make a JSON API request. Returns parsed response body or None for 204."""
     merged = _default_headers(headers, content_type="application/json")
@@ -406,6 +422,7 @@ def api_request(
         timeout=timeout,
         budget=budget,
         client=client,
+        retry_conflict=retry_conflict,
     )
 
     if response.status_code == 204:
@@ -592,6 +609,7 @@ async def _async_do_request_with_retry(
     timeout: float = DEFAULT_TIMEOUT,
     budget: float | None = None,
     client: httpx.AsyncClient | None = None,
+    retry_conflict: bool = False,
 ) -> httpx.Response:
     """Async variant of ``_do_request_with_retry``."""
     deadline = None if budget is None else time.monotonic() + budget
@@ -604,7 +622,8 @@ async def _async_do_request_with_retry(
     last_exc: BaseException | None = None
 
     try:
-        for attempt in range(_MAX_ATTEMPTS):
+        max_attempts = _MAX_ATTEMPTS
+        for attempt in range(_CONFLICT_MAX_ATTEMPTS):
             attempt_timeout = _attempt_timeout(timeout, deadline)
             try:
                 response = await _async_read_within(
@@ -625,7 +644,7 @@ async def _async_do_request_with_retry(
                 last_exc = exc
                 if (
                     method_upper not in _IDEMPOTENT_METHODS
-                    or attempt == _MAX_ATTEMPTS - 1
+                    or attempt >= max_attempts - 1
                 ):
                     raise SandboxError(f"Network error: {exc}") from exc
                 await asyncio.sleep(_retry_delay(_compute_backoff(attempt), deadline))
@@ -633,10 +652,22 @@ async def _async_do_request_with_retry(
             except httpx.HTTPError as exc:
                 raise SandboxError(f"Network error: {exc}") from exc
 
-            if (
+            # A self-clearing 409 is retried only on an idempotent method, like
+            # every other retry here; the flag never overrides that.
+            retry_this_conflict = (
+                retry_conflict
+                and response.status_code == 409
+                and method_upper in _IDEMPOTENT_METHODS
+            )
+            if retry_this_conflict:
+                max_attempts = _CONFLICT_MAX_ATTEMPTS
+
+            is_retryable = (
                 _should_retry_status(method_upper, response.status_code)
-                and attempt < _MAX_ATTEMPTS - 1
-            ):
+                or retry_this_conflict
+            )
+
+            if is_retryable and attempt < max_attempts - 1:
                 delay: float
                 if response.status_code == 429:
                     retry_after = _parse_retry_after(
@@ -675,6 +706,7 @@ async def async_api_request(
     timeout: float = DEFAULT_TIMEOUT,
     budget: float | None = None,
     client: httpx.AsyncClient | None = None,
+    retry_conflict: bool = False,
 ) -> Any:
     """Async variant of api_request."""
     merged = _default_headers(headers, content_type="application/json")
@@ -686,6 +718,7 @@ async def async_api_request(
         timeout=timeout,
         budget=budget,
         client=client,
+        retry_conflict=retry_conflict,
     )
 
     if response.status_code == 204:

@@ -244,6 +244,7 @@ class AsyncSandbox:
                 "DELETE",
                 f"{config.base_url}/sandboxes/{sandbox_id}",
                 headers={"X-API-Key": config.api_key},
+                retry_conflict=True,
             )
         except NotFoundError:
             pass  # Already deleted
@@ -536,6 +537,7 @@ class AsyncSandbox:
                 f"{self._config.base_url}/sandboxes/{self.id}",
                 headers={"X-API-Key": self._config.api_key},
                 client=self._http_client,
+                retry_conflict=True,
             )
         except NotFoundError:
             pass  # Already deleted
